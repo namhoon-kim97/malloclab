@@ -200,6 +200,10 @@ static void *coalesce(void *bp) {
     bp = PREV_BLKP(bp);
   }
   last_p = bp;
+
+  // if ((next_last_pfit >= (char *)bp) && (last_p < (char *)NEXT_BLKP(bp))) {
+  //   last_p = bp;
+  // }
   return bp;
 }
 
