@@ -61,9 +61,7 @@ team_t team = {
 
 /* Given block ptr bp, compute address of its header and footer */
 #define HDRP(bp) ((char *)(bp)-WSIZE)
-
-// Not useed in buddy system
-// #define FTRP(bp) ((char *)(bp) + GET_SIZE(HDRP(bp)) - DSIZE)
+#define FTRP(bp) ((char *)(bp) + GET_SIZE(HDRP(bp)) - DSIZE)
 
 /* Given block ptr bp, compute address of next and previous blocks */
 #define NEXT_BLKP(bp) ((char *)(bp) + GET_SIZE(((char *)(bp)-WSIZE)))
@@ -102,6 +100,8 @@ int mm_init(void) {
   PUT(heap_listp + (SEG_SIZE + 3) * WSIZE, PACK(0, 1)); /* epilogue header */
   heap_listp += (2 * WSIZE);
 
+  extend_heap(4);
+
   if (extend_heap(CHUNKSIZE / WSIZE) == NULL)
     return -1;
   return 0;
@@ -115,8 +115,8 @@ static void *extend_heap(size_t words) {
   if ((long)(bp = mem_sbrk(size)) == -1)
     return NULL;
 
-  PUT(HDRP(bp), PACK(size, 0)); /* Free block header */
-  // PUT(FTRP(bp), PACK(size, 0));         /* Free block footer */
+  PUT(HDRP(bp), PACK(size, 0));         /* Free block header */
+  PUT(FTRP(bp), PACK(size, 0));         /* Free block footer */
   PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1)); /* New epilogue header */
 
   /* Coalesce if the previous block was free */
@@ -125,9 +125,9 @@ static void *extend_heap(size_t words) {
 
 static unsigned int seg_find(size_t size) {
   int i = 0;
-  int next_power = 1;
-  while (next_power < size && i + 1 < SEG_SIZE) {
-    next_power <<= 1;
+  int bound = SEG_SIZE - 1;
+  while ((i < bound) && (size > 1)) {
+    size >>= 1;
     i++;
   }
 
@@ -175,15 +175,22 @@ static void remove_freeblock(void *bp) {
 }
 
 static void place(void *bp, size_t asize) {
-  size_t csize = GET_SIZE(HDRP(bp)); // free 블록의 크기
-  remove_freeblock(bp);
+  size_t csize = GET_SIZE(HDRP(bp));
 
-  while (asize < csize) {
-    csize >>= 1;
-    PUT(HDRP(bp + csize), PACK(csize, 0));
-    put_freeblock(bp + csize);
+  remove_freeblock(bp);
+  if ((csize - asize) >= (2 * DSIZE)) { /* 할당할 크기보다 블록 사이즈가 큰 경우
+                                           나머지를 가용블록으로 쪼갬 */
+    PUT(HDRP(bp), PACK(asize, 1));
+    PUT(FTRP(bp), PACK(asize, 1));
+
+    bp = NEXT_BLKP(bp);
+    PUT(HDRP(bp), PACK(csize - asize, 0));
+    PUT(FTRP(bp), PACK(csize - asize, 0));
+    put_freeblock(bp);
+  } else {
+    PUT(HDRP(bp), PACK(csize, 1));
+    PUT(FTRP(bp), PACK(csize, 1));
   }
-  PUT(HDRP(bp), PACK(csize, 1));
 }
 
 static void put_freeblock(void *bp) {
@@ -220,15 +227,17 @@ static void put_freeblock(void *bp) {
 }
 
 void *mm_malloc(size_t size) {
-  size_t asize = 16;
+  size_t asize;
   size_t extendsize;
   char *bp;
 
   if (size == 0)
     return NULL;
 
-  while (asize < size + DSIZE)
-    asize <<= 1;
+  if (size <= DSIZE)
+    asize = 2 * DSIZE;
+  else
+    asize = DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE);
 
   bp = find_fit(asize);
   if (!bp) {
@@ -241,33 +250,31 @@ void *mm_malloc(size_t size) {
 }
 
 static void *coalesce(void *bp) {
-  put_freeblock(bp);
+  size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(bp)));
+  size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
+  size_t size = GET_SIZE(HDRP(bp));
 
-  size_t csize = GET_SIZE(HDRP(bp));
-  void *root = heap_listp + (SEG_SIZE + 1) * WSIZE;
-  void *left_buddy;
-  void *right_buddy;
-
-  while (1) {
-    if ((bp - root) & csize) {
-      left_buddy = bp - csize;
-      right_buddy = bp;
-    } else {
-      right_buddy = bp + csize;
-      left_buddy = bp;
-    }
-
-    if (!GET_ALLOC(HDRP(left_buddy)) && !GET_ALLOC(HDRP(right_buddy)) &&
-        GET_SIZE(HDRP(left_buddy)) == GET_SIZE(HDRP(right_buddy))) {
-      remove_freeblock(left_buddy);
-      remove_freeblock(right_buddy);
-      csize <<= 1;
-      PUT(HDRP(left_buddy), PACK(csize, 0));
-      put_freeblock(left_buddy);
-      bp = left_buddy;
-    } else
-      break;
+  if (prev_alloc && !next_alloc) { // next 연결
+    size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
+    remove_freeblock(NEXT_BLKP(bp));
+    PUT(HDRP(bp), PACK(size, 0));
+    PUT(FTRP(bp), PACK(size, 0));
+  } else if (!prev_alloc && next_alloc) { // prev 연결
+    size += GET_SIZE(HDRP(PREV_BLKP(bp)));
+    remove_freeblock(PREV_BLKP(bp));
+    bp = PREV_BLKP(bp);
+    PUT(HDRP(bp), PACK(size, 0));
+    PUT(FTRP(bp), PACK(size, 0));
+  } else if (!prev_alloc && !next_alloc) { // next, prev 연결
+    size += GET_SIZE(FTRP(NEXT_BLKP(bp))) + GET_SIZE(HDRP(PREV_BLKP(bp)));
+    remove_freeblock(PREV_BLKP(bp));
+    remove_freeblock(NEXT_BLKP(bp));
+    PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
+    PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0));
+    bp = PREV_BLKP(bp);
   }
+
+  put_freeblock(bp);
   return bp;
 }
 
@@ -278,6 +285,8 @@ void mm_free(void *bp) {
   size_t size = GET_SIZE(HDRP(bp));
 
   PUT(HDRP(bp), PACK(size, 0));
+  PUT(FTRP(bp), PACK(size, 0));
+
   coalesce(bp);
 }
 
