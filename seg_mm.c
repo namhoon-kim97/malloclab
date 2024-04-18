@@ -71,15 +71,23 @@ team_t team = {
 #define NEXT_FREE(bp) (*(void **)(bp + WSIZE))
 
 #define SEG_SIZE 20
-#define SEG_ROOT(class) (*(void **)((char *)(heap_listp) + (WSIZE * class)))
+#define SEG_ROOT(class) (*(void **)((char *)(free_listp) + (WSIZE * class)))
 
-static char *heap_listp; /* Points to the start of the heap */
+static char *free_listp; /* Points to the start of the free class */
 
-static void *coalesce(void *bp);
+/* Function prototypes */
 static void *extend_heap(size_t words);
+static void *coalesce(void *bp);
+static unsigned int seg_find(size_t size);
+static void *find_fit(size_t asize);
+static void place(void *bp, size_t asize);
 static void remove_freeblock(void *bp);
 static void put_freeblock(void *bp);
-static unsigned int seg_find(size_t size);
+
+int mm_init(void);
+void *mm_malloc(size_t size);
+void mm_free(void *bp);
+void *mm_realloc(void *ptr, size_t size);
 
 /*
  * mm_init - initialize the malloc package.
@@ -87,143 +95,22 @@ static unsigned int seg_find(size_t size);
 
 int mm_init(void) {
   /* Create the initial empty heap */
-  if ((heap_listp = mem_sbrk((SEG_SIZE + 4) * WSIZE)) == (void *)-1)
+  if ((free_listp = mem_sbrk((SEG_SIZE + 4) * WSIZE)) == (void *)-1)
     return -1;
-  PUT(heap_listp, 0); /* paddig word */
-  PUT(heap_listp + (1 * WSIZE),
+  PUT(free_listp, 0); /* paddig word */
+  PUT(free_listp + (1 * WSIZE),
       PACK(WSIZE * (SEG_SIZE + 2), 1)); /* prologue header */
   for (int i = 0; i < SEG_SIZE; i++)
-    PUT(heap_listp + ((i + 2) * WSIZE), PACK(0, 0)); /* initialize seg list */
+    PUT(free_listp + ((i + 2) * WSIZE), PACK(0, 0)); /* initialize seg list */
 
-  PUT(heap_listp + (SEG_SIZE + 2) * WSIZE,
+  PUT(free_listp + (SEG_SIZE + 2) * WSIZE,
       PACK((WSIZE * (SEG_SIZE + 2)), 1));               /* prologue footer */
-  PUT(heap_listp + (SEG_SIZE + 3) * WSIZE, PACK(0, 1)); /* epilogue header */
-  heap_listp += (2 * WSIZE);
-
-  extend_heap(4);
+  PUT(free_listp + (SEG_SIZE + 3) * WSIZE, PACK(0, 1)); /* epilogue header */
+  free_listp += (2 * WSIZE);
 
   if (extend_heap(CHUNKSIZE / WSIZE) == NULL)
     return -1;
   return 0;
-}
-
-static void *extend_heap(size_t words) {
-  char *bp;
-  size_t size;
-
-  size = (words % 2) ? (words + 1) * WSIZE : words * WSIZE;
-  if ((long)(bp = mem_sbrk(size)) == -1)
-    return NULL;
-
-  PUT(HDRP(bp), PACK(size, 0));         /* Free block header */
-  PUT(FTRP(bp), PACK(size, 0));         /* Free block footer */
-  PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1)); /* New epilogue header */
-
-  /* Coalesce if the previous block was free */
-  return coalesce(bp);
-}
-
-static unsigned int seg_find(size_t size) {
-  int i = 0;
-  int bound = SEG_SIZE - 1;
-  while ((i < bound) && (size > 1)) {
-    size >>= 1;
-    i++;
-  }
-
-  return i;
-}
-
-static void *find_fit(size_t asize) {
-  int idx = seg_find(asize);
-  void *ptr = NULL;
-
-  // 검색 시작 인덱스에서 SEG_SIZE까지 루프를 수행
-  while (idx < SEG_SIZE) {
-    ptr = SEG_ROOT(idx); // 현재 인덱스에 해당하는 리스트의 루트.
-    while (ptr && (asize > GET_SIZE(HDRP(ptr)))) {
-      ptr = PREV_FREE(ptr); // 이전 가용 블록으로 이동
-    }
-    if (ptr) { // 적절한 블록을 찾았으면 반복 중단
-      break;
-    }
-    idx++; // 다음 세그먼트 리스트로 이동
-  }
-
-  return ptr;
-}
-
-static void remove_freeblock(void *bp) {
-  unsigned int idx = seg_find(GET_SIZE(HDRP(bp)));
-
-  if (PREV_FREE(bp)) {
-    if (NEXT_FREE(bp)) {
-      NEXT_FREE(PREV_FREE(bp)) = NEXT_FREE(bp);
-      PREV_FREE(NEXT_FREE(bp)) = PREV_FREE(bp);
-    } else {
-      NEXT_FREE(PREV_FREE(bp)) = NULL;
-      SEG_ROOT(idx) = PREV_FREE(bp);
-    }
-  } else {
-    if (NEXT_FREE(bp))
-      PREV_FREE(NEXT_FREE(bp)) = NULL;
-    else
-      SEG_ROOT(idx) = NULL;
-  }
-
-  return;
-}
-
-static void place(void *bp, size_t asize) {
-  size_t csize = GET_SIZE(HDRP(bp));
-
-  remove_freeblock(bp);
-  if ((csize - asize) >= (2 * DSIZE)) { /* 할당할 크기보다 블록 사이즈가 큰 경우
-                                           나머지를 가용블록으로 쪼갬 */
-    PUT(HDRP(bp), PACK(asize, 1));
-    PUT(FTRP(bp), PACK(asize, 1));
-
-    bp = NEXT_BLKP(bp);
-    PUT(HDRP(bp), PACK(csize - asize, 0));
-    PUT(FTRP(bp), PACK(csize - asize, 0));
-    put_freeblock(bp);
-  } else {
-    PUT(HDRP(bp), PACK(csize, 1));
-    PUT(FTRP(bp), PACK(csize, 1));
-  }
-}
-
-static void put_freeblock(void *bp) {
-  size_t size = GET_SIZE(HDRP(bp));
-  unsigned int idx = seg_find(size);
-  char *search_ptr = SEG_ROOT(idx);
-  char *insert_ptr = NULL;
-
-  while (search_ptr && (size > GET_SIZE(HDRP(search_ptr)))) {
-    insert_ptr = search_ptr;
-    search_ptr = PREV_FREE(search_ptr);
-  }
-
-  if (search_ptr) {
-    PREV_FREE(bp) = search_ptr;
-    NEXT_FREE(search_ptr) = bp;
-    if (insert_ptr) { /* insert_ptr과 search_ptr사이에 bp 삽입 */
-      NEXT_FREE(bp) = insert_ptr;
-      PREV_FREE(insert_ptr) = bp;
-    } else { /* 맨 처음(루트)에 bp 삽입 */
-      NEXT_FREE(bp) = NULL;
-      SEG_ROOT(idx) = bp;
-    }
-  } else {
-    PREV_FREE(bp) = NULL;
-    if (insert_ptr) { /* 리스트의 끝에 bp 삽입 */
-      NEXT_FREE(bp) = insert_ptr;
-      PREV_FREE(insert_ptr) = bp;
-    } else { /* 맨 처음(루트)에 bp 삽입 */
-      NEXT_FREE(bp) = NULL;
-      SEG_ROOT(idx) = bp;
-    }
-  }
 }
 
 void *mm_malloc(size_t size) {
@@ -234,10 +121,11 @@ void *mm_malloc(size_t size) {
   if (size == 0)
     return NULL;
 
-  if (size <= DSIZE)
-    asize = 2 * DSIZE;
+  if (size <= DSIZE)   /* 8바이트 이하면 */
+    asize = 2 * DSIZE; /* 최소 블록 크기(헤더(4byte) + 풋터(4byte) +
+                          payload(8byte)) 할당*/
   else
-    asize = DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE);
+    asize = DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE); /* DSIZE 정렬 */
 
   bp = find_fit(asize);
   if (!bp) {
@@ -249,38 +137,10 @@ void *mm_malloc(size_t size) {
   return bp;
 }
 
-static void *coalesce(void *bp) {
-  size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(bp)));
-  size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
-  size_t size = GET_SIZE(HDRP(bp));
-
-  if (prev_alloc && !next_alloc) { // next 연결
-    size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
-    remove_freeblock(NEXT_BLKP(bp));
-    PUT(HDRP(bp), PACK(size, 0));
-    PUT(FTRP(bp), PACK(size, 0));
-  } else if (!prev_alloc && next_alloc) { // prev 연결
-    size += GET_SIZE(HDRP(PREV_BLKP(bp)));
-    remove_freeblock(PREV_BLKP(bp));
-    bp = PREV_BLKP(bp);
-    PUT(HDRP(bp), PACK(size, 0));
-    PUT(FTRP(bp), PACK(size, 0));
-  } else if (!prev_alloc && !next_alloc) { // next, prev 연결
-    size += GET_SIZE(FTRP(NEXT_BLKP(bp))) + GET_SIZE(HDRP(PREV_BLKP(bp)));
-    remove_freeblock(PREV_BLKP(bp));
-    remove_freeblock(NEXT_BLKP(bp));
-    PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
-    PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0));
-    bp = PREV_BLKP(bp);
-  }
-
-  put_freeblock(bp);
-  return bp;
-}
-
 /*
  * mm_free - Freeing a block does nothing.
  */
+
 void mm_free(void *bp) {
   size_t size = GET_SIZE(HDRP(bp));
 
@@ -308,4 +168,159 @@ void *mm_realloc(void *ptr, size_t size) {
   memcpy(newptr, oldptr, copySize);
   mm_free(oldptr);
   return newptr;
+}
+
+static void *extend_heap(size_t words) {
+  char *bp;
+  size_t size;
+
+  size = (words % 2) ? (words + 1) * WSIZE : words * WSIZE;
+  if ((long)(bp = mem_sbrk(size)) == -1)
+    return NULL;
+
+  PUT(HDRP(bp), PACK(size, 0));         /* Free block header */
+  PUT(FTRP(bp), PACK(size, 0));         /* Free block footer */
+  PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1)); /* New epilogue header */
+
+  /* Coalesce if the previous block was free */
+  return coalesce(bp);
+}
+
+static void *coalesce(void *bp) {
+  size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(bp)));
+  size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
+  size_t size = GET_SIZE(HDRP(bp));
+
+  if (prev_alloc && !next_alloc) { /* next 가용이면 병합 */
+    size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
+    remove_freeblock(NEXT_BLKP(bp));
+    PUT(HDRP(bp), PACK(size, 0));
+    PUT(FTRP(bp), PACK(size, 0));
+  } else if (!prev_alloc && next_alloc) { /* prev 가용이면 병합 */
+    size += GET_SIZE(HDRP(PREV_BLKP(bp)));
+    remove_freeblock(PREV_BLKP(bp));
+    bp = PREV_BLKP(bp);
+    PUT(HDRP(bp), PACK(size, 0));
+    PUT(FTRP(bp), PACK(size, 0));
+  } else if (!prev_alloc && !next_alloc) { /* next, prev 가용이면 병합 */
+    size += GET_SIZE(FTRP(NEXT_BLKP(bp))) + GET_SIZE(HDRP(PREV_BLKP(bp)));
+    remove_freeblock(PREV_BLKP(bp));
+    remove_freeblock(NEXT_BLKP(bp));
+    PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
+    PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0));
+    bp = PREV_BLKP(bp);
+  }
+
+  put_freeblock(bp);
+  return bp;
+}
+
+static unsigned int seg_find(size_t size) {
+  int i = 0;
+  int bound = SEG_SIZE - 1;
+  while ((i < bound) && (size > 1)) {
+    size >>= 1;
+    i++;
+  }
+
+  return i;
+}
+
+static void *find_fit(size_t asize) {
+  int idx = seg_find(asize);
+  void *ptr = NULL;
+
+  /* 검색 시작 인덱스에서 SEG_SIZE까지 루프를 수행 */
+  while (idx < SEG_SIZE) {
+    ptr = SEG_ROOT(idx); /*  현재 인덱스에 해당하는 리스트의 루트 */
+    while (ptr && (asize > GET_SIZE(HDRP(ptr)))) {
+      ptr = PREV_FREE(ptr); /* 이전 가용 블록으로 이동 */
+    }
+    if (ptr) { /* 적절한 블록을 찾았으면 반복 중단 */
+      break;
+    }
+    idx++; /* 다음 세그먼트 리스트로 이동 */
+  }
+
+  return ptr;
+}
+
+static void place(void *bp, size_t asize) {
+  size_t csize = GET_SIZE(HDRP(bp));
+
+  remove_freeblock(bp);
+  if ((csize - asize) >= (2 * DSIZE)) { /* 할당할 크기보다 블록 사이즈가 큰 경우
+                                           나머지를 가용블록으로 쪼갬 */
+    PUT(HDRP(bp), PACK(asize, 1));
+    PUT(FTRP(bp), PACK(asize, 1));
+
+    bp = NEXT_BLKP(bp);
+    PUT(HDRP(bp), PACK(csize - asize, 0));
+    PUT(FTRP(bp), PACK(csize - asize, 0));
+    put_freeblock(bp); /* 새로 생긴 free block을 list에 추가 */
+  } else {
+    PUT(HDRP(bp), PACK(csize, 1));
+    PUT(FTRP(bp), PACK(csize, 1));
+  }
+}
+
+/*
+ * remove_freeblock - 가용 리스트에서 블록을 제거
+ * @bp: 제거할 블록의 포인터
+ */
+static void remove_freeblock(void *bp) {
+  unsigned int idx = seg_find(GET_SIZE(HDRP(bp)));
+
+  if (PREV_FREE(bp)) {   /* 이전 가용 블록이 존재하는 경우 */
+    if (NEXT_FREE(bp)) { /* 다음 블록이 존재하는 경우 */
+      NEXT_FREE(PREV_FREE(bp)) = NEXT_FREE(bp);
+      PREV_FREE(NEXT_FREE(bp)) = PREV_FREE(bp);
+    } else {
+      NEXT_FREE(PREV_FREE(bp)) = NULL; /* 다음 블록이 없는 경우 NULL 설정 후 */
+      SEG_ROOT(idx) = PREV_FREE(bp); /* 루트 업데이트 */
+    }
+  } else { /* 이전 가용 블록이 없는 경우*/
+    if (NEXT_FREE(bp))
+      PREV_FREE(NEXT_FREE(bp)) = NULL;
+    else /* bp 블록이 리스트의 유일한 블록인 경우, 루트 NULL */
+      SEG_ROOT(idx) = NULL;
+  }
+}
+
+/*
+ * put_freeblock - 주어진 블록을 가용 리스트에 삽입
+ * @bp: 삽입할 블록의 포인터
+ */
+static void put_freeblock(void *bp) {
+  size_t size = GET_SIZE(HDRP(bp));
+  unsigned int idx = seg_find(size);
+  char *search_ptr = SEG_ROOT(idx);
+  char *insert_ptr = NULL;
+
+  /* insert_ptr은 삽입할 위치, search_ptr는 그 다음 블록 위치 */
+  while (search_ptr && (size > GET_SIZE(HDRP(search_ptr)))) {
+    insert_ptr = search_ptr;
+    search_ptr = PREV_FREE(search_ptr);
+  }
+
+  if (search_ptr) {
+    PREV_FREE(bp) = search_ptr;
+    NEXT_FREE(search_ptr) = bp;
+    if (insert_ptr) { /* insert_ptr과 search_ptr사이에 bp 삽입 */
+      NEXT_FREE(bp) = insert_ptr;
+      PREV_FREE(insert_ptr) = bp;
+    } else { /* 맨 처음(루트)에 bp 삽입 */
+      NEXT_FREE(bp) = NULL;
+      SEG_ROOT(idx) = bp;
+    }
+  } else {
+    PREV_FREE(bp) = NULL;
+    if (insert_ptr) { /* 리스트의 끝에 bp 삽입 */
+      NEXT_FREE(bp) = insert_ptr;
+      PREV_FREE(insert_ptr) = bp;
+    } else { /* 맨 처음(루트)에 bp 삽입 */
+      NEXT_FREE(bp) = NULL;
+      SEG_ROOT(idx) = bp;
+    }
+  }
 }
